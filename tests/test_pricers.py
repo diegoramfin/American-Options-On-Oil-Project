@@ -7,14 +7,22 @@ import pytest
 from aoo.bs import bs_price
 from aoo.lsm import lsm_price
 from aoo.tree import implied_vol, tree_lattice, tree_price
-from aoo.validation import HULL_PUT, HULL_TOLERANCE, reference_checks
+from aoo.validation import (
+    DUMMY,
+    DUMMY_BS_PRICES,
+    DUMMY_DIVIDEND,
+    HULL_PUT,
+    HULL_TOLERANCE,
+    dividend_call_lattice,
+    dividend_call_lsm,
+    reference_checks,
+)
 from aoo.vol import hist_vol
 
 
-def test_bs_standard_benchmark():
-    # S = K = 100, T = 1, r = 5%, sigma = 20%: the usual four-decimal benchmark.
-    assert bs_price(100, 100, 1, 0.05, 0.2, kind="call") == pytest.approx(10.4506, abs=1e-4)
-    assert bs_price(100, 100, 1, 0.05, 0.2, kind="put") == pytest.approx(5.5735, abs=1e-4)
+@pytest.mark.parametrize("kind", ["call", "put"])
+def test_bs_dummy_benchmark(kind):
+    assert bs_price(**DUMMY, kind=kind) == pytest.approx(DUMMY_BS_PRICES[kind], abs=1e-4)
 
 
 def test_bs_put_call_parity():
@@ -77,13 +85,32 @@ def test_lattice_root_matches_tree_price():
 
 def test_lsm_put_matches_tree():
     # LSM exercises on 50 dates only and is low-biased, so allow 3 standard errors plus 0.01.
-    price, stderr = lsm_price(**HULL_PUT, n_steps=50, kind="put")
+    price, stderr, early = lsm_price(**HULL_PUT, n_steps=50, kind="put")
     assert price == pytest.approx(tree_price(**HULL_PUT, n=500, kind="put"), abs=3 * stderr + 0.01)
+    assert early > 0  # some paths exercise the put early
 
 
-def test_lsm_call_matches_bs_without_dividend():
-    price, stderr = lsm_price(**HULL_PUT, n_steps=50, kind="call")
-    assert price == pytest.approx(bs_price(**HULL_PUT, kind="call"), abs=3 * stderr)
+def test_lsm_call_equals_bs_without_dividend():
+    # No early exercise for a call when q = 0, so the control variate makes LSM exact.
+    price, stderr, early = lsm_price(**HULL_PUT, n_steps=50, kind="call")
+    assert price == pytest.approx(bs_price(**HULL_PUT, kind="call"), abs=1e-9)
+    assert stderr == pytest.approx(0.0, abs=1e-9)
+    assert early == 0.0
+
+
+def test_dividend_call_exercises_early():
+    # With a dividend yield, holding a deep in-the-money call forgoes dividends, so early
+    # exercise pays: the American call is worth more than the European call.
+    american = tree_price(**DUMMY, q=DUMMY_DIVIDEND, n=1000, kind="call")
+    european = bs_price(**DUMMY, q=DUMMY_DIVIDEND, kind="call")
+    assert american > european + 0.3
+    lsm = dividend_call_lsm()
+    assert lsm.price == pytest.approx(american, abs=3 * lsm.stderr + 0.01)
+    assert lsm.early_exercise > 0
+    # In the lattice, exercise happens only in the money, at the high stock prices.
+    for stock, _, exercised in dividend_call_lattice():
+        assert (stock[exercised] > DUMMY["K"]).all()
+    assert any(exercised.any() for _, _, exercised in dividend_call_lattice())
 
 
 def test_hist_vol_recovers_known_sigma():

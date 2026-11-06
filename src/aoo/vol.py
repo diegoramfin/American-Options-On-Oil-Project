@@ -1,4 +1,10 @@
-"""Historical volatility: sigma = sqrt(252) * stdev(daily log returns)."""
+"""Historical volatility from daily closes.
+
+Assumption: daily log returns u_i = ln(S_i / S_(i-1)) are i.i.d. normal, as under GBM, over
+252 trading days a year.
+    sigma = sqrt(252) * stdev(u)          (annualised)
+    standard error = sigma / sqrt(2 n)    (n = number of returns in the lookback window)
+"""
 
 import numpy as np
 import pandas as pd

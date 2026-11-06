@@ -1,6 +1,6 @@
 """Excel report laid out like a bank pricing model.
 
-Sheets: Inputs, Quotes, Smile, Surface, Tree, Monte Carlo, Checks.
+Sheets: Inputs, Quotes, Smile, Surface, Tree, Monte Carlo, Validation.
 Colour code, applied automatically by _value: blue = hard-coded input or value computed in
 Python, black = formula, green = formula that links to another sheet. Grey = comment.
 """
@@ -44,11 +44,13 @@ class PricingRun:
     n_steps: int
     max_spread: float
     n_pulled: int
-    quotes: pd.DataFrame  # expiry, T, kind, strike, bid, ask, mid, tree_am, bs_eu, iv, otm
+    # expiry, T, kind, strike, bid, ask, mid, lsm, lsm_se, tree_am, bs_eu, iv, otm
+    quotes: pd.DataFrame
     smile_quotes: pd.DataFrame  # OTM quotes with an implied vol, sorted by expiry and strike
     surface_fit: pd.DataFrame  # implied vol, index K/S grid, columns expiries
     parity: pd.DataFrame  # expiry, pairs, passed
-    reference_checks: list[tuple[str, float, float]]  # label, Hull value, model
+    validation: list  # sections of (title, rows of (label, reference, model), note)
+    dividend_lattice: list  # dummy American call with a dividend, for the Validation sheet
     # Illustrative at-the-money put, shared by the Tree and Monte Carlo sheets.
     contract: str
     strike: float
@@ -57,6 +59,9 @@ class PricingRun:
     benchmarks: list[tuple[str, float]]  # (label, price) the Monte Carlo is compared with
     lsm: pd.DataFrame  # paths, price, stderr
     exercise_dates: int
+    lsm_paths: int
+    max_exercise_dates: int
+    confirm_tolerance: float
     sample_paths: pd.DataFrame  # index time in years, one column per simulated path
 
 
@@ -69,7 +74,7 @@ def write_report(path: Path, run: PricingRun) -> None:
     _surface_sheet(wb, run, refs)
     _tree_sheet(wb, run)
     _monte_carlo_sheet(wb, run)
-    _checks_sheet(wb, run)
+    _validation_sheet(wb, run)
     wb.save(path)
 
 
@@ -175,8 +180,14 @@ def _inputs_sheet(wb, run) -> dict[str, str]:
              f"{run.base_window} lookback: balances estimation error against stale regimes"),
         ],
         "Model Settings": [
-            ("n_steps", "Tree steps per contract", "n", run.n_steps, COUNT,
-             "Cox-Ross-Rubinstein binomial tree"),
+            ("lsm_paths", "LSM paths per expiry", "", run.lsm_paths, COUNT,
+             "Main pricer; one path set shared by all strikes of an expiry"),
+            ("max_dates", "LSM max exercise dates", "", run.max_exercise_dates, COUNT,
+             "Daily exercise up to this cap; longer expiries are priced as Bermudan"),
+            ("n_steps", "Tree time steps, minimum", "n", run.n_steps, COUNT,
+             "Steps the tree splits T into (Δt = T / n): one per business day, at least this many"),
+            ("tolerance", "Confirmation tolerance", "", run.confirm_tolerance, PRICE,
+             "Tree confirms LSM when |LSM − tree| ≤ 2 s.e. + this (one tick; covers tree error)"),
             ("max_spread", "Max bid-ask spread kept", "", run.max_spread, "0%",
              "Quotes with (ask − bid) / mid above this are dropped"),
         ],
@@ -207,8 +218,9 @@ def _inputs_sheet(wb, run) -> dict[str, str]:
 
 
 QUOTE_COLUMNS = [
-    "Expiry", "T (years)", "Type", "Strike", "K / S", "Bid", "Ask", "Mid", "Tree (American)",
-    "Black-Scholes (European)", "Tree − Mid", "Tree − BS", "Implied Vol", "OTM",
+    "Expiry", "T (years)", "Type", "Strike", "K / S", "Bid", "Ask", "Mid", "LSM (American)",
+    "LSM s.e.", "Tree (American)", "Black-Scholes (European)", "LSM − Mid", "LSM − Tree",
+    "Tree confirms", "Implied Vol", "OTM",
 ]  # fmt: skip
 
 
@@ -217,14 +229,17 @@ def _quotes_sheet(wb, run, refs):
         wb,
         "Quotes",
         "Option Quotes and Model Prices",
-        f"BNO options | tree n = {run.n_steps}, σ = {run.base_window} historical | "
-        "implied vol solved on the American tree | OTM = used in Smile and Surface",
+        f"BNO options | σ = {run.base_window} historical | main price: LSM; confirmation: tree "
+        f"(one time step per business day, at least {run.n_steps}), confirmed within 2 s.e. + "
+        "tolerance | implied vol on the "
+        "tree | "
+        "OTM = used in Smile and Surface",
     )
     _header(ws, HEADER_ROW, 2, QUOTE_COLUMNS)
     spot = refs["spot"]
     for i, q in enumerate(run.quotes.itertuples(index=False)):
         r = HEADER_ROW + 1 + i
-        row = [  # columns B..O, in QUOTE_COLUMNS order
+        row = [  # columns B..R, in QUOTE_COLUMNS order
             (q.expiry.to_pydatetime(), DATE),
             (q.T, RATIO),
             (q.kind.capitalize(), None),
@@ -233,19 +248,22 @@ def _quotes_sheet(wb, run, refs):
             (q.bid, PRICE),
             (q.ask, PRICE),
             (f"=(G{r}+H{r})/2", PRICE),
+            (q.lsm, PRICE),
+            (q.lsm_se, PRECISE),
             (q.tree_am, PRICE),
             (q.bs_eu, PRICE),
             (f"=J{r}-I{r}", PRICE),
-            (f"=J{r}-K{r}", PRICE),
+            (f"=J{r}-L{r}", PRICE),
+            (f'=IF(ABS(O{r})<=2*K{r}+{refs["tolerance"]},"Yes","No")', None),
             (None if pd.isna(q.iv) else q.iv, PCT),
             (f'=IF(D{r}="Call",E{r}>={spot},E{r}<{spot})', None),
         ]
         for j, (value, fmt) in enumerate(row):
             _value(ws, r, 2 + j, value, fmt)
     ws.freeze_panes = f"C{HEADER_ROW + 1}"
-    ws.auto_filter.ref = f"B{HEADER_ROW}:O{HEADER_ROW + len(run.quotes)}"
+    ws.auto_filter.ref = f"B{HEADER_ROW}:R{HEADER_ROW + len(run.quotes)}"
     ws.row_dimensions[HEADER_ROW].height = 30
-    _widths(ws, {get_column_letter(c): 12 for c in range(2, 16)} | {"J": 14, "K": 16})
+    _widths(ws, {get_column_letter(c): 12 for c in range(2, 19)} | {"M": 16})
 
 
 def _smile_sheet(wb, run, refs):
@@ -350,27 +368,23 @@ def _tree_sheet(wb, run):
         wb,
         "Tree",
         "Binomial Tree (CRR), American Put",
-        f"{run.contract} | lattice drawn with {n} steps; shaded = early exercise is optimal | "
-        f"quotes are priced with n = {run.n_steps}",
+        f"{run.contract} | lattice drawn with n = {n} time steps (Δt = T / n); shaded = early "
+        "exercise is optimal | "
+        f"quotes use one time step per business day, at least {run.n_steps}",
     )
-    top = HEADER_ROW
-    for title, layer_index in (("Stock price", 0), ("American put value", 1)):
-        _header(ws, top, 2, [title] + [f"Step {i}" for i in range(n + 1)])
-        for i, layer in enumerate(run.lattice):
-            exercised = layer[2]
-            for j, value in enumerate(layer[layer_index]):
-                # Up-moves go up the page: all-up node on the first row, all-down on the last.
-                cell = _value(ws, top + 1 + n + i - 2 * j, 3 + i, value, PRICE)
-                if layer_index == 1 and exercised[j]:
-                    cell.fill = EXERCISE_FILL
-        top += 2 * n + 3
+    top = _lattice(ws, HEADER_ROW, run.lattice, "American put value")
 
     # Convergence in the number of steps.
     _header(
         ws,
         top,
         2,
-        ["Tree steps n", "Tree American put", "Tree European call", "Black-Scholes call"],
+        [
+            "Time steps n (Δt = T / n)",
+            "Tree American put",
+            "Tree European call",
+            "Black-Scholes call",
+        ],
     )
     first = top + 1
     for i, (steps, am_put, eu_call, bs_call) in enumerate(run.convergence.itertuples(index=False)):
@@ -379,7 +393,7 @@ def _tree_sheet(wb, run):
         _value(ws, first + i, 4, eu_call, PRECISE)
         _value(ws, first + i, 5, bs_call, PRECISE)
     last = first + len(run.convergence) - 1
-    chart = _scatter("Tree price vs number of steps", "Steps n", "Price", "0", "0.000")
+    chart = _scatter("Tree price vs number of time steps n", "Time steps n", "Price", "0", "0.000")
     _add_series(chart, ws, 2, 3, first, last, "Tree American put", marker="none")
     _add_series(chart, ws, 2, 4, first, last, "Tree European call", marker="none")
     _add_series(chart, ws, 2, 5, first, last, "Black-Scholes call", marker="none", dash="dash")
@@ -393,7 +407,8 @@ def _monte_carlo_sheet(wb, run):
         "Monte Carlo",
         "Longstaff-Schwartz Monte Carlo, American Put",
         f"{run.contract} | {run.exercise_dates} exercise dates | regression of discounted cash "
-        "flow on 1, x, x², x³ with x = S / K, in-the-money paths only",
+        "flow on 1, x, x², x³ with x = S / K, in-the-money paths only | Black-Scholes control "
+        "variate",
     )
     best = run.lsm.iloc[-1]
     row = HEADER_ROW
@@ -461,42 +476,86 @@ def _monte_carlo_sheet(wb, run):
     _widths(ws, {"B": 34, "C": 12, "D": 12, "E": 20, "F": 12, "G": 12})
 
 
-def _checks_sheet(wb, run):
-    ws = _sheet(wb, "Checks", "Model Validation", "Textbook values and market data checks")
-    row = HEADER_ROW
-    _header(ws, row, 2, ["Textbook values (Hull)", "Reference", "Model", "Difference"])
-    for label, reference, model in run.reference_checks:
-        row += 1
-        _cell(ws, row, 2, label)
-        _value(ws, row, 3, reference, PRECISE)
-        _value(ws, row, 4, model, PRECISE)
-        _value(ws, row, 5, f"=D{row}-C{row}", DIFF)
+def _validation_sheet(wb, run):
+    ws = _sheet(
+        wb,
+        "Validation",
+        "Model Validation",
+        "Dummy data and textbook values (no market data), then LSM vs tree and market data "
+        "checks on the snapshot | Difference = model − reference",
+    )
+    row = HEADER_ROW - 3
+    for title, rows, note in run.validation:
+        row += 3
+        _header(ws, row, 2, [title, "Reference", "Model", "Difference"])
+        for label, reference, model in rows:
+            row += 1
+            _cell(ws, row, 2, label)
+            _value(ws, row, 3, reference, PRECISE)
+            _value(ws, row, 4, model, PRECISE)
+            _value(ws, row, 5, f"=D{row}-C{row}", DIFF)
+        _note(ws, row + 1, note)
+
+    row = _lattice(ws, row + 3, run.dividend_lattice, "American call value (dividend)")
+
+    # LSM confirmed by the tree, counted live from the Quotes sheet.
+    last = HEADER_ROW + len(run.quotes)
+    dates = f"Quotes!$B${HEADER_ROW + 1}:$B${last}"
+    confirms = f"Quotes!$P${HEADER_ROW + 1}:$P${last}"
+    rows = [
+        (expiry, f"=COUNTIF({dates},B{{row}})", f'=COUNTIFS({dates},B{{row}},{confirms},"Yes")')
+        for expiry in sorted(run.quotes["expiry"].unique())
+    ]
+    row = _pass_rate_table(ws, row, "LSM confirmed by tree (2 s.e. + tolerance)", "Quotes", rows)
     _note(
         ws,
         row + 1,
-        "Hull, Options, Futures and Other Derivatives: American put S = K = 50, r = 10%, "
-        "σ = 40%, T = 5 months; Black-Scholes S = 42, K = 40, r = 10%, σ = 20%, T = 6 months. "
-        "Tests allow 0.005.",
+        "Expect about 95% at 2 s.e. Strikes of one expiry share paths, so misses cluster "
+        f"by expiry. Long expiries use at most {run.max_exercise_dates} exercise dates.",
     )
 
-    row += 3
-    _header(ws, row, 2, ["Put-call bounds on market mids", "Pairs", "Passed", "Pass rate"])
-    first = row + 1
-    for expiry, pairs, passed in run.parity.itertuples(index=False):
-        row += 1
-        _value(ws, row, 2, expiry.to_pydatetime(), DATE).alignment = Alignment(horizontal="left")
-        _value(ws, row, 3, pairs, COUNT)
-        _value(ws, row, 4, passed, COUNT)
-        _value(ws, row, 5, f"=IF(C{row}=0,0,D{row}/C{row})", PCT)
-    row += 1
-    _cell(ws, row, 2, "Total", bold=True)
-    _value(ws, row, 3, f"=SUM(C{first}:C{row - 1})", COUNT, bold=True)
-    _value(ws, row, 4, f"=SUM(D{first}:D{row - 1})", COUNT, bold=True)
-    _value(ws, row, 5, f"=IF(C{row}=0,0,D{row}/C{row})", PCT, bold=True)
+    rows = list(run.parity.itertuples(index=False))
+    row = _pass_rate_table(ws, row + 3, "Put-call bounds on market mids", "Pairs", rows)
     _note(
         ws,
         row + 1,
         "Bounds: S − K < C − P < S − K·e^(−rT). Failures usually mean stale or "
         "non-synchronous quotes, not a model error.",
     )
-    _widths(ws, {"B": 46, "C": 18, "D": 18, "E": 14})
+    _widths(ws, {"B": 52, "C": 14, "D": 14, "E": 14, "F": 12, "G": 12, "H": 12, "I": 12})
+
+
+def _lattice(ws, top, lattice, value_title):
+    """Stock and option lattices, early-exercise nodes shaded. Return the row after them."""
+    n = len(lattice) - 1
+    for title, layer_index in (("Stock price", 0), (value_title, 1)):
+        _header(ws, top, 2, [title] + [f"Step {i}" for i in range(n + 1)])
+        for i, (_, _, exercised) in enumerate(lattice):
+            for j, value in enumerate(lattice[i][layer_index]):
+                # Up-moves go up the page: all-up node on the first row, all-down on the last.
+                cell = _value(ws, top + 1 + n + i - 2 * j, 3 + i, value, PRICE)
+                if layer_index == 1 and exercised[j]:
+                    cell.fill = EXERCISE_FILL
+        top += 2 * n + 3
+    return top
+
+
+def _pass_rate_table(ws, row, title, count_label, rows):
+    """Rows of (expiry, count, passed) with a pass-rate formula and a total row.
+    Count and passed may be formulas containing {row}. Return the total row."""
+    _header(ws, row, 2, [title, count_label, "Passed", "Pass rate"])
+    first = row + 1
+    for expiry, count, passed in rows:
+        row += 1
+        _value(ws, row, 2, pd.Timestamp(expiry).to_pydatetime(), DATE).alignment = Alignment(
+            horizontal="left"
+        )
+        for col, value in ((3, count), (4, passed)):
+            _value(ws, row, col, value.format(row=row) if isinstance(value, str) else value, COUNT)
+        _value(ws, row, 5, f"=IF(C{row}=0,0,D{row}/C{row})", PCT)
+    row += 1
+    _cell(ws, row, 2, "Total", bold=True)
+    _value(ws, row, 3, f"=SUM(C{first}:C{row - 1})", COUNT, bold=True)
+    _value(ws, row, 4, f"=SUM(D{first}:D{row - 1})", COUNT, bold=True)
+    _value(ws, row, 5, f"=IF(C{row}=0,0,D{row}/C{row})", PCT, bold=True)
+    return row

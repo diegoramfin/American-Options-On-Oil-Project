@@ -1,4 +1,15 @@
-"""Black-Scholes-Merton European price with continuous dividend yield q (q=0 for BNO)."""
+"""Black-Scholes-Merton price of a European option (exercise only at expiry).
+
+Assumptions: under the risk-neutral measure the underlying follows geometric Brownian motion,
+    dS = (r - q) S dt + sigma S dW,
+with constant risk-free rate r, dividend yield q and volatility sigma; frictionless,
+continuously traded market. For BNO, q = 0.
+
+Formula (S spot, K strike, T years to expiry, N the standard normal CDF):
+    d1 = [ln(S / K) + (r - q + sigma^2 / 2) T] / (sigma sqrt(T)),   d2 = d1 - sigma sqrt(T)
+    call = S e^(-qT) N(d1) - K e^(-rT) N(d2)
+    put  = K e^(-rT) N(-d2) - S e^(-qT) N(-d1)
+"""
 
 import math
 

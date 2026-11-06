@@ -1,75 +1,73 @@
 # American Options on Brent (FE 620)
 
-Prices American options on **BNO**, the United States Brent Oil Fund (an ETF), with a
-binomial tree. Black-Scholes is the European cross-check. Run steps are in
-[docs/QUICKSTART.md](docs/QUICKSTART.md).
+Prices American options on **BNO** (United States Brent Oil Fund, an ETF, and the only
+Brent-linked underlying with options on Yahoo Finance) in the Black-Scholes model.
+Longstaff-Schwartz Monte Carlo (LSM) is the main pricer; a binomial tree confirms it.
+
+## Quick start
+
+Run from the project root.
+
+    python3 -m venv .venv && source .venv/bin/activate
+    pip install -r requirements.txt
+
+    python scripts/snapshot.py         # freeze today's market data (internet)
+    python scripts/price_snapshot.py   # price the latest snapshot, offline (~2.5 min)
+    python -m pytest -q                # validation tests (~15 s)
+    black src scripts tests            # format before committing
+
+- `snapshot.py` writes `data/snapshots/<YYYY-MM-DD>/` and overwrites that day's folder.
+- `price_snapshot.py` writes `reports/<date>_pricing.xlsx`. Pass a date to price an older
+  snapshot: `python scripts/price_snapshot.py 2026-11-06`.
+- Yahoo serves only the current option chain, so a historical date means a saved snapshot.
 
 ## Architecture
 
     yfinance ─► scripts/snapshot.py ─► data/snapshots/<date>/ ─► scripts/price_snapshot.py ─► reports/<date>_pricing.xlsx
                  (network)              (frozen inputs)            (offline)
 
-Two stages keep the numbers reproducible. The network stage saves a frozen snapshot,
-and the analysis stage reads only that snapshot.
-
-## Modules
-
-| File | Role |
+| Module | Role |
 |---|---|
-| `src/aoo/data.py` | Snapshot layout (`UNDERLYING`, `RATE`, `SNAP_DIR`) and the offline loader |
-| `src/aoo/vol.py` | Historical volatility: √252 × stdev of daily log returns, with its standard error |
-| `src/aoo/tree.py` | Cox-Ross-Rubinstein binomial tree (American or European, dividend yield q) and implied vol |
-| `src/aoo/bs.py` | Black-Scholes European price, the closed-form check on the tree |
-| `src/aoo/lsm.py` | Longstaff-Schwartz Monte Carlo for American options (GBM paths, cubic regression) |
-| `src/aoo/validation.py` | Textbook reference values (Hull), shared by the tests and the Checks sheet |
-| `src/aoo/report.py` | Excel layout only: sheets, formulas, colours, charts |
-| `scripts/snapshot.py` | Saves BNO option chains, BNO closes and T-bill closes for today |
-| `scripts/price_snapshot.py` | Cleans quotes, prices them, solves implied vol, runs checks, writes the workbook |
-| `tests/test_pricers.py` | Correctness tests |
+| `src/aoo/data.py` | Snapshot layout and offline loader |
+| `src/aoo/vol.py` | Historical volatility (6m / 3m / 1m lookbacks) |
+| `src/aoo/bs.py` | Black-Scholes European price |
+| `src/aoo/tree.py` | Binomial tree: confirmation pricer, lattice, implied vol |
+| `src/aoo/lsm.py` | Main pricer: LSM with a Black-Scholes control variate |
+| `src/aoo/validation.py` | Dummy-data and textbook (Hull) validation cases |
+| `src/aoo/report.py` | Excel layout only |
+| `scripts/price_snapshot.py` | The pipeline: clean quotes, price, validate, write the workbook |
+| `tests/test_pricers.py` | Automated validation |
 
-## Modelling choices
+Each model module's docstring states its assumptions and formulas.
 
-- **Underlying:** BNO shares, treated as a stock with dividend yield q = 0. This is not
-  Brent crude or Brent futures, so the futures risk-neutral probability does not apply.
-- **Tree probability:** p = (e^((r−q)Δt) − d) / (u − d), with u = e^(σ√Δt) and d = 1/u.
-- **Rate:** 13-week T-bill (`^IRX`) divided by 100.
-- **Time:** business days / 252 (trading-day convention).
-- **Volatility:** 6m / 3m / 1m lookbacks of 126 / 63 / 21 trading days; the tree uses 3m.
-- **Smile and surface:** out-of-the-money quotes only (puts below spot, calls above).
+## Pricing engine
 
-## Validation reference points
+One model, Black-Scholes (GBM, constant r, q and σ), solved three ways:
 
-| Check | Reference | Tolerance | Where |
-|---|---|---|---|
-| Black-Scholes | Textbook S=K=100, T=1, r=5%, σ=20%: call 10.4506, put 5.5735 | 1e-4 | tests |
-| Hull: American put (S=K=50, r=10%, σ=40%, T=5m) | n=5 4.49, n=30 4.263, n=50 4.272, n=100 4.278, n=500 4.283 | 0.005 | tests, Checks sheet |
-| Hull: Black-Scholes (S=42, K=40, r=10%, σ=20%, T=6m) | call 4.76, put 0.81 | 0.005 | tests, Checks sheet |
-| Tree → Black-Scholes | European tree vs BS as n grows | 0.001 at n=4000 | tests, Checks sheet |
-| American call = European call | No dividend, so early exercise is never optimal | 1e-6 | tests |
-| American put ≥ European put and ≥ intrinsic | Holds for any n | strict | tests |
-| Put-call parity (European BS) | C − P = S − K·e^(−rT) | 1e-9 | tests |
-| LSM put vs tree | Hull put, 50 exercise dates, 100,000 paths | 3 s.e. + 0.01 | tests, Monte Carlo sheet |
-| LSM call vs Black-Scholes | No dividend, so the American call is European | 3 s.e. | tests |
-| Implied vol | Tree price at a known σ solves back to that σ; NaN at or below intrinsic | 1e-6 | tests |
-| Historical vol | Known alternating returns | relative 1e-10 | tests |
-| Put-call bounds on market mids | S − K < C − P < S − K·e^(−rT) | reported, not enforced | Checks sheet |
-
-Tree convergence is not monotone. The error oscillates in n, so validate at large n.
-
-## Output: `reports/<date>_pricing.xlsx`
-
-Colour code: blue = input or value from Python, black = formula, green = link to another sheet.
-
-| Sheet | Contents |
+| Role | Method |
 |---|---|
-| Inputs | Spot, rate, dividend yield, the three historical volatilities, tree settings, data counts |
-| Quotes | One row per cleaned quote: bid, ask, mid, tree and BS prices, model − mid, implied vol |
-| Smile | OTM implied vol against K/S for the three nearest expiries, with a chart and historical σ |
-| Surface | OTM implied vol by strike × expiry, colour-scaled; interpolated K/S grid with a 3D surface chart |
-| Tree | Stock and put lattice for an ATM put (early exercise shaded); price vs steps chart |
-| Monte Carlo | LSM vs tree vs Black-Scholes; LSM vs paths with ±2 s.e. band; 20 sample paths |
-| Checks | Hull textbook values, put-call bound pass rates |
+| Main price | LSM: 20,000 paths per expiry shared by its strikes, daily exercise up to 50 dates |
+| Confirmation | Binomial tree, one time step per business day (at least 100); confirmed when \|LSM − tree\| ≤ 2 s.e. + $0.01 |
+| Implied vol | Solved on the tree (root-finding needs a smooth price; LSM is noisy) |
+| Closed form | Black-Scholes: LSM's paths and control variate; exact for calls when q = 0; American − BS = early-exercise premium |
 
-## Not built yet
+Inputs: BNO price at the pull, 13-week T-bill (`^IRX`) for r, q = 0, σ from a 3-month lookback,
+time in business days / 252.
 
-Delta-hedging backtest, final report. LSM prices one illustrative contract; the quotes are priced with the tree.
+## Validation
+
+Lives in `tests/test_pricers.py` (pass/fail), `src/aoo/validation.py` (cases and reference
+values) and the workbook's Validation sheet (for the report):
+
+- Dummy data (S = K = 100, T = 1, r = 5%, σ = 20%): Black-Scholes benchmark, tree vs
+  Black-Scholes, and an American call with an 8% dividend where early exercise appears.
+- Hull textbook values for the tree and Black-Scholes, matched to every printed digit.
+- On market data: LSM confirmed by the tree per quote, and put-call bounds on the quotes.
+
+## Workbook
+
+`Inputs` · `Quotes` (every quote, all methods) · `Smile` · `Surface` (heatmap and 3D chart) ·
+`Tree` (lattice and convergence) · `Monte Carlo` (LSM study and sample paths) · `Validation`.
+Blue = input, black = formula, green = link to another sheet.
+
+Open review items: [docs/REVIEW.md](docs/REVIEW.md).

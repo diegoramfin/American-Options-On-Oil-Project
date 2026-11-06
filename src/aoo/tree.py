@@ -1,6 +1,19 @@
-"""Cox-Ross-Rubinstein binomial tree for European and American options.
+"""Cox-Ross-Rubinstein (CRR) binomial tree for European and American options.
 
-Stock-type underlying: risk-neutral p = (exp((r-q)dt) - d) / (u - d).
+Assumptions: the Black-Scholes model (GBM with constant r, q, sigma), discretised in time.
+The option's life T is split into n time steps of length dt = T / n; each step the price
+moves up by u or down by d:
+    u = e^(sigma sqrt(dt)),   d = 1 / u,   p = (e^((r - q) dt) - d) / (u - d)
+where p is the risk-neutral probability of an up move. After i steps with j up moves the
+price is S u^(2j - i).
+
+Backward induction from the payoff at expiry:
+    hold = e^(-r dt) [p V(up) + (1 - p) V(down)]
+    European: V = hold;   American: V = max(hold, payoff from exercising now)
+
+The price converges to the Black-Scholes model value as n grows; the error oscillates in n
+and shrinks roughly like 1 / n. Implied vol is the sigma at which the American tree price
+equals a market price, found with Brent's root-finder.
 """
 
 import numpy as np
@@ -10,6 +23,7 @@ IV_BOUNDS = (1e-3, 3.0)  # implied-vol search range: 0.1% to 300%
 
 
 def tree_price(S, K, T, r, sigma, q=0.0, n=100, kind="call", american=True):
+    """Option price from an n-time-step tree. kind is "call" or "put"."""
     return _backward_induction(S, K, T, r, sigma, q, n, kind, american)[0]
 
 

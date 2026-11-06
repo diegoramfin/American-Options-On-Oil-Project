@@ -3,5 +3,6 @@ pandas
 scipy
 yfinance
 openpyxl
+tqdm
 pytest
 black
